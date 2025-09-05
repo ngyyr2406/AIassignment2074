@@ -3,7 +3,9 @@ import pandas as pd
 import re, string
 import nltk
 import contractions
-from joblib import load
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
+import torch
+import torch.nn.functional as F
 from nltk.corpus import stopwords
 from nltk.stem import WordNetLemmatizer
 from nltk.tokenize import word_tokenize
@@ -12,6 +14,7 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import chardet
 import io
+import numpy as np
 
 # ---- One-time NLTK setup (downloads if missing; cached between runs) ----
 @st.cache_resource
@@ -40,21 +43,26 @@ def _ensure_nltk():
 
 _ = _ensure_nltk()
 
-# ---- Load artifacts (model + vectorizer) ----
+# ---- Load BERT artifacts (model + tokenizer) ----
 @st.cache_resource
 def load_artifacts():
-    mdl = load("SVM.joblib")
-    vect = load("tfidf_vectorizer.joblib")
+    mdl = AutoModelForSequenceClassification.from_pretrained("./bert_model")
+    vect = AutoTokenizer.from_pretrained("./bert_tokenizer")
     return mdl, vect
 
-model, vectorizer = load_artifacts()
+model, tokenizer = load_artifacts()
+
+# Check if models loaded successfully
+if model is None or tokenizer is None:
+    st.error("❌ Failed to load BERT model. Please fix the model files and restart the app.")
+    st.stop()
 
 # ---- NLP tools ----
 stop_words = set(stopwords.words("english"))
 lemmatizer = WordNetLemmatizer()
-APPLY_SPELL_CORRECTION = False  # toggle if you later add TextBlob
+APPLY_SPELL_CORRECTION = False
 
-# ---- Clean function ----
+# ---- Clean function (kept for compatibility, but BERT can handle raw text better) ----
 def clean_text(text: str) -> str:
     text = contractions.fix(str(text))                                 # expand "don't" -> "do not"
     text = text.encode("ascii", errors="ignore").decode()              # drop non-ascii/garbled
@@ -62,7 +70,6 @@ def clean_text(text: str) -> str:
     text = text.lower()                                                # lowercase
     text = re.sub(r"\d+", "", text)                                    # remove numbers
     words = word_tokenize(text)                                        # tokenize
-    # optional spell correction (off by default)
     if APPLY_SPELL_CORRECTION:
         from textblob import TextBlob
         words = [str(TextBlob(w).correct()) for w in words]
@@ -70,13 +77,41 @@ def clean_text(text: str) -> str:
                if w not in stop_words and len(w) > 1]
     return " ".join(cleaned)
 
+# ---- BERT prediction function ----
+def predict_sentiment_bert(text):
+    """Predict sentiment using BERT model"""
+    if pd.isna(text) or str(text).strip() == '':
+        return 'unknown'
+    
+    cleaned = clean_text(str(text))
+    if cleaned.strip() == '':
+        return 'unknown'
+    
+    # Tokenize the text
+    inputs = tokenizer(cleaned, return_tensors="pt", truncation=True, 
+                      padding=True, max_length=512)
+    
+    # Make prediction
+    with torch.no_grad():
+        outputs = model(**inputs)
+        predictions = F.softmax(outputs.logits, dim=-1)
+        predicted_class = torch.argmax(predictions, dim=-1).item()
+    
+    # Assuming 0 = negative, 1 = positive
+    if predicted_class == 0:
+        return 'negative'
+    elif predicted_class == 1:
+        return 'positive'
+    else:
+        return 'unknown'
+
 # ---- CSV Reading function with encoding detection ----
 def read_csv_with_encoding(file):
     """Read CSV file with automatic encoding detection"""
     try:
-        # First, try to detect encoding
+        # try to detect encoding
         raw_data = file.read()
-        file.seek(0)  # Reset file pointer
+        file.seek(0)
         
         # Detect encoding
         detected = chardet.detect(raw_data)
@@ -114,19 +149,11 @@ def read_csv_with_encoding(file):
 
 @st.cache_data
 def predict_batch(texts):
-    """Predict sentiment for a list of texts"""
+    """Predict sentiment for a list of texts using BERT"""
     results = []
     for text in texts:
-        if pd.isna(text) or str(text).strip() == '':
-            results.append('unknown')
-        else:
-            cleaned = clean_text(str(text))
-            if cleaned.strip() == '':
-                results.append('unknown')
-            else:
-                features = vectorizer.transform([cleaned])
-                pred = model.predict(features)[0]
-                results.append(pred.lower())
+        sentiment = predict_sentiment_bert(text)
+        results.append(sentiment)
     return results
 
 def find_review_column(df):
@@ -147,7 +174,6 @@ if "total_reviews" not in st.session_state:
     st.session_state.negative = 0
 if "csv_results" not in st.session_state:
     st.session_state.csv_results = None
-# Initialize session state for preserving inputs and results
 if "user_text_input" not in st.session_state:
     st.session_state.user_text_input = ""
 if "last_prediction" not in st.session_state:
@@ -166,7 +192,7 @@ page = st.sidebar.selectbox("Choose a page:", ["✍️ Review Prediction", "📁
 # ---- Review Prediction Page ----
 if page == "✍️ Review Prediction":
     st.title("🍟 McDonald's Review Sentiment Classifier")
-    st.write("Here's a demo of how the model classifies reviews into **Positive** or **Negative**.")
+    st.write("Here's a demo of how the BERT model classifies reviews into **Positive** or **Negative**.")
 
     # Demo Sentiment Table
     st.subheader("🧾 Demo Sentiment Table")
@@ -191,16 +217,11 @@ if page == "✍️ Review Prediction":
         'Positive', 'Negative', 'Positive', 'Negative', 'Positive'
     ]
     
-    # Generate dynamic predictions using the loaded model
+    # Generate dynamic predictions
     predicted_sentiments = []
     for review in demo_reviews:
-        cleaned = clean_text(review)
-        if cleaned.strip() == '':
-            predicted_sentiments.append('Unknown')
-        else:
-            features = vectorizer.transform([cleaned])
-            pred = model.predict(features)[0]
-            predicted_sentiments.append(pred.capitalize())  # Capitalize to match format
+        sentiment = predict_sentiment_bert(review)
+        predicted_sentiments.append(sentiment.capitalize())
     
     demo_data = {
         'Review': demo_reviews,
@@ -210,7 +231,7 @@ if page == "✍️ Review Prediction":
     
     demo_df = pd.DataFrame(demo_data)
     
-    # Display the table with styling
+    # Display the table
     st.dataframe(
         demo_df,
         use_container_width=True,
@@ -218,13 +239,12 @@ if page == "✍️ Review Prediction":
         column_config={
             "Review": st.column_config.TextColumn("Review", width="large"),
             "Actual Sentiment": st.column_config.TextColumn("Actual Sentiment", width="medium"),
-            "Predicted Sentiment": st.column_config.TextColumn("Predicted Sentiment (Dynamic)", width="medium")
+            "Predicted Sentiment": st.column_config.TextColumn("Predicted Sentiment (BERT)", width="medium")
         }
     )
     
     st.markdown("---")
 
-    # Text input - MODIFIED: Use session state to preserve input
     st.write("Now try typing your own review below to see the prediction in action!")
     user_text = st.text_area("✍️ Type a review here:", value=st.session_state.user_text_input, height=160, placeholder="e.g., The fries were crispy and the staff were super friendly!", key="review_text_area")
     
@@ -241,8 +261,7 @@ if page == "✍️ Review Prediction":
             st.warning("Please enter a review first.")
         else:
             cleaned = clean_text(user_text)
-            features = vectorizer.transform([cleaned])
-            pred = model.predict(features)[0]  # e.g., "positive" or "negative"
+            pred = predict_sentiment_bert(user_text)
 
             # Store prediction in session state
             st.session_state.last_prediction = pred
@@ -268,14 +287,14 @@ if page == "✍️ Review Prediction":
         else:
             st.error("❌ Predicted Sentiment: **Negative** 😞")
         
-        # Show the cleaned text (useful for demo)
+        # Show the cleaned text
         with st.expander("See cleaned text used for prediction"):
             st.code(st.session_state.last_cleaned_text)
 
 # ---- CSV Analysis Page ----
 elif page == "📁 CSV Analysis":
     st.title("📁 CSV Analysis")
-    st.write("Upload a CSV file with reviews to analyze sentiment.")
+    st.write("Upload a CSV file with reviews to analyze sentiment using BERT.")
     
     uploaded_file = st.file_uploader("Choose a CSV file", type="csv")
     
@@ -308,7 +327,7 @@ elif page == "📁 CSV Analysis":
                     st.session_state.csv_results = None
                     st.session_state.csv_analysis_done = False
                 else:
-                    with st.spinner("Analyzing sentiments... This may take a moment for large files."):
+                    with st.spinner("Analyzing sentiments with BERT... This may take a moment for large files."):
                         # Get texts from review column
                         texts = df[review_column].tolist()
                         
@@ -403,7 +422,7 @@ elif page == "📁 CSV Analysis":
         with col4:
             st.metric("Unknown/Empty", csv_unknown)
         
-        # Create visualizations (Dashboard style)
+        # Visualizations
         total_analyzed = csv_positive + csv_negative
         
         if total_analyzed > 0:
@@ -427,7 +446,7 @@ elif page == "📁 CSV Analysis":
                 fig_bar.update_layout(title="Sentiment Count", xaxis_title="Sentiment", yaxis_title="Number of Reviews", height=400, showlegend=False)
                 st.plotly_chart(fig_bar, use_container_width=True)
             
-            # Percentage breakdown
+            # Percentage
             pos_percent = (csv_positive / total_analyzed) * 100
             neg_percent = (csv_negative / total_analyzed) * 100
             
